@@ -92,11 +92,27 @@ function createWindow() {
   win.on("page-title-updated", (e) => e.preventDefault());
 }
 
-app.whenReady().then(async () => {
-  await loadBTTV();
-  createWindow();
-});
+const gotTheLock = app.requestSingleInstanceLock();
 
-app.on("window-all-closed", () => {
+if (!gotTheLock) {
+  // Another instance is already running – quit immediately
   app.quit();
-});
+} else {
+  // When a second instance is launched, focus the existing window
+  app.on("second-instance", () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    }
+  });
+
+  app.whenReady().then(async () => {
+    await loadBTTV();
+    createWindow();
+  });
+
+  app.on("window-all-closed", () => {
+    app.quit();
+  });
+}
