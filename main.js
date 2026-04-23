@@ -98,13 +98,9 @@ if (!gotTheLock) {
   // Another instance is already running – quit immediately
   app.quit();
 } else {
-  // When a second instance is launched, focus the existing window
+  // When a second instance is launched, open a new window (shares session/login)
   app.on("second-instance", () => {
-    const win = BrowserWindow.getAllWindows()[0];
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
-    }
+    createWindow();
   });
 
   app.whenReady().then(async () => {
