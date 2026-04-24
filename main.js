@@ -1,72 +1,83 @@
-const { app, BrowserWindow, session } = require("electron");
+const { app, BrowserWindow, session, net, shell, dialog } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const AdmZip = require("adm-zip");
 
 app.setName("MultiStreamer");
 
-// BTTV is loaded as a Chrome extension from the user's Chrome install
 const BTTV_ID = "ajopnjidmegmdimjlfnijceegpefgped";
+const CRX_URL = `https://clients2.google.com/service/update2/crx?response=redirect&prodversion=130.0&acceptformat=crx2,crx3&x=id%3D${BTTV_ID}%26uc`;
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-
-function findChromeExtension(extId) {
-  const chromeBase = path.join(
-    process.env.LOCALAPPDATA,
-    "Google",
-    "Chrome",
-    "User Data"
-  );
-  if (!fs.existsSync(chromeBase)) return null;
-
-  // Search all Chrome profiles (Default, Profile 1, Profile 2, etc.)
-  const profiles = fs.readdirSync(chromeBase).filter((name) => {
-    return name === "Default" || name.startsWith("Profile ");
+function downloadCRX(url) {
+  return new Promise((resolve, reject) => {
+    const request = net.request(url);
+    const chunks = [];
+    request.on("response", (response) => {
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        const redirectUrl = Array.isArray(response.headers.location)
+          ? response.headers.location[0]
+          : response.headers.location;
+        downloadCRX(redirectUrl).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode !== 200) {
+        reject(new Error(`HTTP ${response.statusCode}`));
+        return;
+      }
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve(Buffer.concat(chunks)));
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end();
   });
-
-  for (const profile of profiles) {
-    const extDir = path.join(chromeBase, profile, "Extensions", extId);
-    if (!fs.existsSync(extDir)) continue;
-
-    // Get the latest version folder
-    const versions = fs.readdirSync(extDir).sort();
-    if (versions.length === 0) continue;
-
-    const latestVersion = path.join(extDir, versions[versions.length - 1]);
-    if (fs.existsSync(path.join(latestVersion, "manifest.json"))) {
-      return latestVersion;
-    }
-  }
-  return null;
 }
 
-function copyDirSync(src, dest) {
-  fs.mkdirSync(dest, { recursive: true });
-  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-    const srcPath = path.join(src, entry.name);
-    const destPath = path.join(dest, entry.name);
-    if (entry.isDirectory()) {
-      copyDirSync(srcPath, destPath);
-    } else {
-      fs.copyFileSync(srcPath, destPath);
-    }
+function extractCRX(crxBuffer, destPath) {
+  // CRX3 format: "Cr24" (4) + version (4) + header_length (4) + header + ZIP
+  const headerLen = crxBuffer.readUInt32LE(8);
+  const zipStart = 12 + headerLen;
+  const zipBuffer = crxBuffer.subarray(zipStart);
+
+  if (fs.existsSync(destPath)) {
+    fs.rmSync(destPath, { recursive: true });
   }
+  const zip = new AdmZip(zipBuffer);
+  zip.extractAllTo(destPath, true);
 }
 
 async function loadBTTV() {
-  const localDir = path.join(app.getPath("userData"), "extensions");
-  fs.mkdirSync(localDir, { recursive: true });
+  const extDir = path.join(app.getPath("userData"), "extensions");
+  const destPath = path.join(extDir, BTTV_ID);
+  const stampFile = path.join(extDir, `${BTTV_ID}.stamp`);
 
-  const chromePath = findChromeExtension(BTTV_ID);
-  if (!chromePath) {
-    console.log("BetterTTV: not found in Chrome, skipping");
-    return;
+  fs.mkdirSync(extDir, { recursive: true });
+
+  // Check if we need to download (missing or stale cache)
+  let needsDownload = !fs.existsSync(path.join(destPath, "manifest.json"));
+  if (!needsDownload && fs.existsSync(stampFile)) {
+    const age = Date.now() - fs.statSync(stampFile).mtimeMs;
+    needsDownload = age > CACHE_MAX_AGE_MS;
   }
 
-  const destPath = path.join(localDir, BTTV_ID);
-  try {
-    if (fs.existsSync(destPath)) {
-      fs.rmSync(destPath, { recursive: true });
+  if (needsDownload) {
+    try {
+      console.log("BetterTTV: downloading from Chrome Web Store...");
+      const crxBuffer = await downloadCRX(CRX_URL);
+      extractCRX(crxBuffer, destPath);
+      fs.writeFileSync(stampFile, String(Date.now()));
+      console.log("BetterTTV: downloaded and extracted");
+    } catch (e) {
+      console.error("BetterTTV: download failed -", e.message);
+      if (!fs.existsSync(path.join(destPath, "manifest.json"))) {
+        return; // No cached version to fall back on
+      }
+      console.log("BetterTTV: using cached version");
     }
-    copyDirSync(chromePath, destPath);
+  }
+
+  try {
     await session.defaultSession.loadExtension(destPath);
     console.log("BetterTTV: loaded successfully");
   } catch (e) {
@@ -74,6 +85,55 @@ async function loadBTTV() {
   }
 }
 
+
+const REPO_RELEASES_URL = "https://github.com/Lucidic15/MultiStreamer-Electron/releases";
+const GITHUB_API_LATEST = "https://api.github.com/repos/Lucidic15/MultiStreamer-Electron/releases/latest";
+
+function fetchJSON(url) {
+  return new Promise((resolve, reject) => {
+    const request = net.request(url);
+    request.setHeader("User-Agent", "MultiStreamer");
+    const chunks = [];
+    request.on("response", (response) => {
+      if (response.statusCode !== 200) {
+        reject(new Error(`HTTP ${response.statusCode}`));
+        return;
+      }
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+        catch (e) { reject(e); }
+      });
+      response.on("error", reject);
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function checkForUpdates(win) {
+  try {
+    const release = await fetchJSON(GITHUB_API_LATEST);
+    const latest = release.tag_name.replace(/^v/, "");
+    const current = app.getVersion();
+    if (latest === current) return;
+
+    const { response } = await dialog.showMessageBox(win, {
+      type: "info",
+      title: "Update Available",
+      message: `A new version of MultiStreamer is available (v${latest}).\nYou are currently on v${current}.`,
+      buttons: ["Download", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+    });
+
+    if (response === 0) {
+      shell.openExternal(REPO_RELEASES_URL);
+    }
+  } catch (e) {
+    console.error("Update check failed:", e.message);
+  }
+}
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -90,6 +150,8 @@ function createWindow() {
 
   // Keep the title fixed so taskbar and Volume Mixer show "MultiStreamer"
   win.on("page-title-updated", (e) => e.preventDefault());
+
+  win.webContents.once("did-finish-load", () => checkForUpdates(win));
 }
 
 const gotTheLock = app.requestSingleInstanceLock();
